@@ -103,6 +103,32 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    # SSL4RL custom reward functions for VLM self-supervised learning tasks
+    elif "imagenet_qa" in data_source:
+        from . import ssl4rl
+
+        res = ssl4rl.compute_score(solution_str, ground_truth)
+
+    elif "JigsawQA" in data_source:
+        from . import jigsaw
+
+        res = jigsaw.compute_score(solution_str, ground_truth)
+
+    elif "RotationQA" in data_source:
+        from . import ssl4rl
+
+        res = ssl4rl.compute_score(solution_str, ground_truth)
+
+    elif "ContrastiveQA" in data_source or "ContrastiveQA_strong" in data_source:
+        from . import ssl4rl
+
+        res = ssl4rl.compute_score(solution_str, ground_truth)
+
+    elif "PositionQA" in data_source or "PositionQA_augmented" in data_source:
+        from . import ssl4rl
+
+        res = ssl4rl.compute_score(solution_str, ground_truth)
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
