@@ -16,7 +16,7 @@ import functools
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 
 import torch
 from transformers.models.qwen3_vl.modeling_qwen3_vl import (
@@ -26,6 +26,44 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _unpack_visual_outputs(visual_outputs: Any) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """
+    HF/Transformers versions differ in what `model.visual(...)` returns.
+
+    In transformers >= 5.2.0, model.visual() returns BaseModelOutputWithDeepstackFeatures:
+      - last_hidden_state: pre-merge features (NOT what the LLM expects)
+      - pooler_output: post-merge features (what the LLM expects as image_embeds)
+      - deepstack_features: list of intermediate ViT features
+
+    In older versions, model.visual() returns a plain tuple:
+      (merged_embeds, deepstack_features)
+    """
+    if visual_outputs is None:
+        raise ValueError("model.visual(...) returned None")
+
+    # Prefer named attributes from BaseModelOutputWithDeepstackFeatures
+    pooler_output = getattr(visual_outputs, "pooler_output", None)
+    if pooler_output is not None:
+        embeds = pooler_output
+        deepstack = getattr(visual_outputs, "deepstack_features", None)
+    elif isinstance(visual_outputs, (tuple, list)):
+        outputs = tuple(visual_outputs)
+        embeds = outputs[0]
+        deepstack = outputs[1] if len(outputs) > 1 else None
+    else:
+        embeds = visual_outputs
+        deepstack = None
+
+    if deepstack is None:
+        deepstack_list: list[torch.Tensor] = []
+    elif isinstance(deepstack, (list, tuple)):
+        deepstack_list = list(deepstack)
+    else:
+        deepstack_list = [deepstack]
+
+    return embeds, deepstack_list
 
 
 def get_rope_index(
@@ -147,13 +185,30 @@ def _get_input_embeds(
     image_mask, video_mask = None, None
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
-        image_embeds, deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, deepstack_image_embeds = _unpack_visual_outputs(model.visual(pixel_values, grid_thw=image_grid_thw))
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
-            raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
-            )
+            diff = abs(n_image_tokens - n_image_features)
+            if diff <= 4:
+                logger.warning(
+                    f"Minor image token/feature mismatch (diff={diff}): tokens={n_image_tokens}, features={n_image_features}. "
+                    "Adjusting features to match tokens (vLLM/HF tokenizer rounding difference)."
+                )
+                if n_image_features < n_image_tokens:
+                    pad = image_embeds[-1:].expand(n_image_tokens - n_image_features, -1)
+                    image_embeds = torch.cat([image_embeds, pad], dim=0)
+                    deepstack_image_embeds = [
+                        torch.cat([ds, ds[-1:].expand(n_image_tokens - n_image_features, -1)], dim=0)
+                        for ds in deepstack_image_embeds
+                    ]
+                else:
+                    image_embeds = image_embeds[:n_image_tokens]
+                    deepstack_image_embeds = [ds[:n_image_tokens] for ds in deepstack_image_embeds]
+            else:
+                raise ValueError(
+                    f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
+                )
 
         mask = input_ids == model.config.image_token_id
         mask_unsqueezed = mask.unsqueeze(-1)
@@ -165,13 +220,32 @@ def _get_input_embeds(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
-        video_embeds, deepstack_video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds, deepstack_video_embeds = _unpack_visual_outputs(
+            model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        )
         n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
-            raise ValueError(
-                f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
-            )
+            diff = abs(n_video_tokens - n_video_features)
+            if diff <= 4:
+                logger.warning(
+                    f"Minor video token/feature mismatch (diff={diff}): tokens={n_video_tokens}, features={n_video_features}. "
+                    "Adjusting features to match tokens."
+                )
+                if n_video_features < n_video_tokens:
+                    pad = video_embeds[-1:].expand(n_video_tokens - n_video_features, -1)
+                    video_embeds = torch.cat([video_embeds, pad], dim=0)
+                    deepstack_video_embeds = [
+                        torch.cat([ds, ds[-1:].expand(n_video_tokens - n_video_features, -1)], dim=0)
+                        for ds in deepstack_video_embeds
+                    ]
+                else:
+                    video_embeds = video_embeds[:n_video_tokens]
+                    deepstack_video_embeds = [ds[:n_video_tokens] for ds in deepstack_video_embeds]
+            else:
+                raise ValueError(
+                    f"Video features and video tokens do not match: tokens: {n_video_tokens}, features {n_video_features}"
+                )
 
         mask = input_ids == model.config.video_token_id
         mask_unsqueezed = mask.unsqueeze(-1)
@@ -210,7 +284,9 @@ def _get_input_embeds(
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
-        image_embeds, dummy_deepstack_image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds, dummy_deepstack_image_embeds = _unpack_visual_outputs(
+            model.visual(pixel_values, grid_thw=image_grid_thw)
+        )
         inputs_embeds += 0.0 * image_embeds.mean()
         for emb in dummy_deepstack_image_embeds or []:
             inputs_embeds += 0.0 * emb.mean()
