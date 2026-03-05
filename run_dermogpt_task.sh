@@ -375,8 +375,9 @@ apptainer exec --nv \
     actor_rollout_ref.rollout.name="${ROLLOUT_BACKEND}" \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.dtype=bfloat16 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_kwargs="{min_pixels:${MIN_PIXELS},max_pixels:${MAX_PIXELS}}" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.enable_prefix_caching=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
@@ -391,9 +392,9 @@ apptainer exec --nv \
     trainer.experiment_name="verl_dermogpt_${TASK}_${RUN_ID}" \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=50 \
-    trainer.test_freq=50 \
-    trainer.log_val_generations=2 \
+    trainer.save_freq=5 \
+    trainer.test_freq=5 \
+    trainer.log_val_generations=5 \
     trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
     trainer.default_local_dir="${SAVE_DIR}" \
     trainer.total_epochs=20 \

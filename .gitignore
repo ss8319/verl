@@ -132,3 +132,5 @@ outputs
 .history
 
 out_files/*
+.out
+.err
