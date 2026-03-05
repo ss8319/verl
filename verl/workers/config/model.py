@@ -106,6 +106,9 @@ class HFModelConfig(BaseConfig):
     # custom chat template for the model
     custom_chat_template: Optional[str] = None
 
+    # Image processor kwargs for VLMs (e.g., min_pixels, max_pixels for Qwen3-VL)
+    image_processor_kwargs: dict = field(default_factory=dict)
+
     external_lib: Optional[str] = None
 
     override_config: dict = field(default_factory=dict)
@@ -156,6 +159,14 @@ class HFModelConfig(BaseConfig):
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
             self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
             self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
+
+            # Apply image processor kwargs (e.g., min_pixels, max_pixels for Qwen3-VL)
+            if self.processor is not None and self.image_processor_kwargs:
+                image_processor = getattr(self.processor, "image_processor", None)
+                if image_processor is not None:
+                    for key, value in self.image_processor_kwargs.items():
+                        if hasattr(image_processor, key):
+                            setattr(image_processor, key, value)
 
         if self.custom_chat_template is not None:
             if self.processor is not None:
