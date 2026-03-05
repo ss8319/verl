@@ -41,6 +41,11 @@ from verl.utils.ulysses import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Defaults when FlashAttention/NPU flash are unavailable.
+_flash_supports_window_size = False
+_flash_supports_deterministic = False
+_flash_use_top_left_mask = False
+
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
@@ -49,7 +54,8 @@ if is_flash_attn_2_available():
     _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
     _flash_use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
-if is_npu_available:
+_npu_available = is_npu_available() if callable(is_npu_available) else bool(is_npu_available)
+if _npu_available:
     from transformers.integrations.npu_flash_attention import npu_flash_attn_func as flash_attn_func
     from transformers.integrations.npu_flash_attention import npu_flash_attn_varlen_func as flash_attn_varlen_func
     from transformers.modeling_flash_attention_utils import flash_attn_supports_top_left_mask
@@ -195,6 +201,29 @@ def _custom_flash_attention_forward(
     """
     Patches flash attention forward to handle 3D position ids in mrope. (3, batch_size, seq_length)
     """
+    def _sdpa_fallback() -> torch.Tensor:
+        import torch.nn.functional as F
+
+        # SDPA expects (batch, heads, seq, dim)
+        q = query_states.transpose(1, 2)
+        k = key_states.transpose(1, 2)
+        v = value_states.transpose(1, 2)
+
+        attn_mask = attention_mask
+        if attn_mask is not None and attn_mask.ndim in (3, 4) and attn_mask.size(1) == 1:
+            # Expand (batch, 1, q, k) -> (batch, heads, q, k)
+            attn_mask = attn_mask.expand(attn_mask.size(0), q.size(1), attn_mask.size(-2), attn_mask.size(-1))
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=kwargs.get("dropout", 0.0),
+            is_causal=is_causal,
+        )
+        return out.transpose(1, 2)  # (batch, seq, heads, dim)
+
     # Assuming 4D tensors, key_states.shape[1] is the key/value sequence length (source length).
     use_sliding_windows = (
         _flash_supports_window_size and sliding_window is not None and key_states.shape[1] > sliding_window
@@ -225,6 +254,14 @@ def _custom_flash_attention_forward(
         position_ids = dist.all_gather(position_ids_lst, position_ids, group=get_ulysses_sequence_parallel_group())
         position_ids = torch.cat(position_ids_lst, dim=-1)  # (batch_size, seq_length)
 
+    # FlashAttention kernels are CUDA-only. If tensors are on CPU, allow SDPA fallback.
+    if query_states.device.type != "cuda":
+        attn_output = _sdpa_fallback()
+        if sp_size > 1:
+            # (batch_size, seq_length, num_head, head_size)
+            attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1)
+        return attn_output
+
     if position_ids is not None and query_length != 1 and not (torch.diff(position_ids, dim=-1) >= 0).all():
         batch_size = query_states.size(0)
         q, k, v, (cu_seqlens_q, cu_seqlens_k), (max_seqlen_q, max_seqlen_k) = prepare_fa2_from_position_ids(
@@ -245,6 +282,8 @@ def _custom_flash_attention_forward(
         )
         attn_output = attn_output.view(batch_size, -1, attn_output.size(-2), attn_output.size(-1))
     else:
+        # ON CUDA: We want FlashAttention for performance and correctness.
+        # This will raise an error if FlashAttention is missing/broken on CUDA.
         attn_output = _flash_attention_forward(
             query_states,
             key_states,
@@ -286,9 +325,38 @@ def qwen2_vl_attn_forward(
 
     # Because the input can be padded, the absolute sequence length depends on the max position id.
     cos, sin = position_embeddings
-    query_states, key_states = apply_multimodal_rotary_pos_emb(
-        query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
-    )
+    # Qwen2-VL vs Qwen2.5-VL compatibility:
+    # - Qwen2.5-VL uses `self.config.rope_parameters["mrope_section"]`
+    # - Qwen2-VL variants may use `rope_scaling["mrope_section"]` (module or config)
+    config = getattr(self, "config", None)
+    mrope_section = None
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict):
+        mrope_section = rope_parameters.get("mrope_section") or rope_parameters.get("mrope_sections")
+
+    if mrope_section is None:
+        rope_scaling = getattr(self, "rope_scaling", None)
+        if rope_scaling is None:
+            rope_scaling = getattr(config, "rope_scaling", None) if config is not None else None
+        if isinstance(rope_scaling, dict):
+            mrope_section = rope_scaling.get("mrope_section") or rope_scaling.get("mrope_sections")
+
+    if mrope_section is None:
+        mrope_section = getattr(self, "mrope_section", None)
+    if mrope_section is None:
+        mrope_section = getattr(config, "mrope_section", None) if config is not None else None
+
+    # transformers signatures differ across versions; prefer passing mrope_section, then fall back.
+    try:
+        if mrope_section is not None:
+            query_states, key_states = apply_multimodal_rotary_pos_emb(
+                query_states, key_states, cos, sin, mrope_section
+            )
+        else:
+            query_states, key_states = apply_multimodal_rotary_pos_emb(query_states, key_states, cos, sin)
+    except TypeError:
+        query_states, key_states = apply_multimodal_rotary_pos_emb(query_states, key_states, cos, sin)
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
     dropout_rate = 0.0 if not self.training else self.attention_dropout
@@ -341,11 +409,81 @@ def _get_input_embeds(
     image_grid_thw: Optional[torch.LongTensor] = None,
     video_grid_thw: Optional[torch.LongTensor] = None,
 ):
+    def _unwrap_visual_output(output: object) -> torch.Tensor:
+        if torch.is_tensor(output):
+            embeds = output
+        elif hasattr(output, "last_hidden_state"):
+            embeds = getattr(output, "last_hidden_state")
+        elif isinstance(output, (tuple, list)) and len(output) > 0:
+            embeds = output[0]
+        else:
+            raise TypeError(f"Unsupported visual output type: {type(output)!r}")
+
+        if not torch.is_tensor(embeds):
+            raise TypeError(f"Unsupported visual embeds type: {type(embeds)!r}")
+
+        # Some HF outputs keep a batch dimension; flatten to match masked_scatter usage.
+        if embeds.ndim == 3:
+            embeds = embeds.reshape(-1, embeds.shape[-1])
+
+        return embeds
+
+    def _find_visual_merger(visual_module: object):
+        # Works across plain modules, FSDP-wrapped modules, and some PEFT wrappers.
+        seen: set[int] = set()
+        stack = [visual_module]
+        while stack:
+            m = stack.pop()
+            if m is None:
+                continue
+            mid = id(m)
+            if mid in seen:
+                continue
+            seen.add(mid)
+
+            merger = getattr(m, "merger", None)
+            if merger is not None:
+                return merger
+
+            for attr in ("module", "model", "base_model"):
+                stack.append(getattr(m, attr, None))
+
+        return None
+
+    def _maybe_merge_visual_embeds(
+        visual_module: object, embeds: torch.Tensor, expected_tokens: int
+    ) -> torch.Tensor:
+        if expected_tokens <= 0:
+            return embeds
+
+        n_features = int(embeds.shape[0])
+        if n_features == expected_tokens:
+            return embeds
+
+        # Qwen2-VL commonly produces pre-merge features that are (spatial_merge_size^2) times larger.
+        merge_size = getattr(getattr(visual_module, "config", None), "spatial_merge_size", None)
+        if merge_size is None:
+            merge_size = getattr(visual_module, "spatial_merge_size", None)
+        merge_factor = int(merge_size) ** 2 if merge_size is not None else 4
+
+        if n_features != expected_tokens * merge_factor:
+            return embeds
+
+        merger = _find_visual_merger(visual_module)
+        if merger is None:
+            return embeds
+
+        merged = merger(embeds)
+        if torch.is_tensor(merged) and merged.ndim == 3:
+            merged = merged.reshape(-1, merged.shape[-1])
+        return merged
+
     inputs_embeds = model.get_input_embeddings()(input_ids)
     if pixel_values is not None:
         pixel_values = pixel_values.type(model.visual.dtype)
-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = _unwrap_visual_output(model.visual(pixel_values, grid_thw=image_grid_thw))
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
+        image_embeds = _maybe_merge_visual_embeds(model.visual, image_embeds, n_image_tokens)
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
             raise ValueError(
@@ -362,8 +500,9 @@ def _get_input_embeds(
 
     if pixel_values_videos is not None:
         pixel_values_videos = pixel_values_videos.type(model.visual.dtype)
-        video_embeds = model.visual(pixel_values_videos, grid_thw=video_grid_thw)
+        video_embeds = _unwrap_visual_output(model.visual(pixel_values_videos, grid_thw=video_grid_thw))
         n_video_tokens = (input_ids == model.config.video_token_id).sum().item()
+        video_embeds = _maybe_merge_visual_embeds(model.visual, video_embeds, n_video_tokens)
         n_video_features = video_embeds.shape[0]
         if n_video_tokens != n_video_features:
             raise ValueError(
@@ -383,7 +522,7 @@ def _get_input_embeds(
         patch_dim = config.in_channels * config.temporal_patch_size * config.patch_size**2
         pixel_values = torch.zeros((16, patch_dim), dtype=inputs_embeds.dtype, device=inputs_embeds.device)
         image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.long, device=inputs_embeds.device)
-        image_embeds = model.visual(pixel_values, grid_thw=image_grid_thw)
+        image_embeds = _unwrap_visual_output(model.visual(pixel_values, grid_thw=image_grid_thw))
         inputs_embeds += 0.0 * image_embeds.mean()
 
     if attention_mask is not None:
