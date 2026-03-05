@@ -336,9 +336,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     raise NotImplementedError(f"Unknown architecture {model_config['architectures']}")
 
                 with init_empty_weights():
-                    save_model = auto_model_cls.from_config(
-                        model_config, torch_dtype=torch.bfloat16, trust_remote_code=self.trust_remote_code
-                    )
+                    # Set the dtype on the config object to avoid the 'unexpected keyword argument' error
+                    # which occurs in some versions of transformers for Vision2Seq models.
+                    model_config.torch_dtype = getattr(unwrap_model, 'dtype', next(unwrap_model.parameters()).dtype)
+                    save_model = auto_model_cls.from_config(model_config, trust_remote_code=self.trust_remote_code)
 
                 save_model.to_empty(device="cpu")
 
