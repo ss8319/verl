@@ -350,6 +350,8 @@ class ValidationGenerationsLogger:
     experiment_name: str = None
 
     def log(self, loggers, samples, step):
+        if "console" in loggers:
+            self.log_generations_to_console(samples, step)
         if "wandb" in loggers:
             self.log_generations_to_wandb(samples, step)
         if "swanlab" in loggers:
@@ -364,6 +366,21 @@ class ValidationGenerationsLogger:
 
         if "vemlp_wandb" in loggers:
             self.log_generations_to_vemlp_wandb(samples, step)
+
+    def log_generations_to_console(self, samples, step):
+        """Log samples to console in a readable format"""
+        print(f"\n" + "=" * 80, flush=True)
+        print(f"VALIDATION GENERATIONS - STEP {step}", flush=True)
+        print("=" * 80, flush=True)
+        for i, sample in enumerate(samples):
+            # sample is (input, output, score)
+            input_text, output_text, score = sample[0], sample[1], sample[2]
+            print(f"\n--- SAMPLE {i + 1} ---", flush=True)
+            print(f"PROMPT (with special tokens):\n{input_text}", flush=True)
+            print(f"GENERATION:\n{output_text}", flush=True)
+            print(f"SCORE: {score}", flush=True)
+            print("-" * 40, flush=True)
+        print("=" * 80 + "\n", flush=True)
 
     def log_generations_to_vemlp_wandb(self, samples, step):
         from volcengine_ml_platform import wandb as vemlp_wandb
