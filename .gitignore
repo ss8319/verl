@@ -134,3 +134,17 @@ outputs
 out_files/*
 .out
 .err
+*.out
+*.err
+filter_prompts_*.py
+build_flash_attn_*.err
+build_flash_attn_*.out
+qwen3_*.err
+qwen3_*.out
+ssl4rl_*.err
+ssl4rl_*.out
+ssl4rl_err_tail.txt
+datasets
+datasets/
+models/
+models_v2/

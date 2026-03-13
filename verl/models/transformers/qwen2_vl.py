@@ -294,6 +294,7 @@ def _custom_flash_attention_forward(
             sliding_window=sliding_window,
             use_top_left_mask=use_top_left_mask,
             deterministic=deterministic,
+            attn_implementation="flash_attention_2",
             **kwargs,
         )  # do not pass position_ids to old flash_attention_forward
 

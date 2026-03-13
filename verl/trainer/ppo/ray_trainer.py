@@ -304,6 +304,7 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._checkpoint_history = []  # List of dicts: {'step': int, 'path': str, 'metric': float}
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -848,6 +849,67 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
+    def _manage_checkpoints(self, val_metrics=None):
+        """Manage checkpoints: keep latest n and best k."""
+        # 1. Update metric for current step if available
+        if val_metrics:
+            metric_key = self.config.trainer.get('best_metric_key')
+            if metric_key:
+                current_metric = val_metrics.get(metric_key)
+                if current_metric is None:
+                    # Try suffix match (e.g., if metric_key is "reward/mean@1")
+                    for k, v in val_metrics.items():
+                        if k.endswith(metric_key):
+                            current_metric = v
+                            break
+
+                if current_metric is not None:
+                    # Find current step in history and update metric
+                    found = False
+                    for ckpt in self._checkpoint_history:
+                        if ckpt['step'] == self.global_steps:
+                            ckpt['metric'] = current_metric
+                            found = True
+                            break
+                    if not found:
+                        # This can happen if validation runs BEFORE first save
+                        pass
+
+        # 2. Determine which checkpoints to keep
+        save_best_k = self.config.trainer.get('save_best_k', 0)
+        max_latest_to_keep = self.config.trainer.get('max_actor_ckpt_to_keep', 1)
+        if save_best_k <= 0:
+            # If save_best_k is not used, we just let verl handle it via max_ckpt_to_keep in save_checkpoint
+            return
+
+        mode = self.config.trainer.get('best_metric_mode', 'max')
+        
+        # Sort by step desc
+        self._checkpoint_history.sort(key=lambda x: x['step'], reverse=True)
+        
+        latest_steps = [ckpt['step'] for ckpt in self._checkpoint_history[:max_latest_to_keep]]
+        
+        best_steps = []
+        if save_best_k > 0:
+            # Only consider checkpoints that HAVE a metric
+            ckpts_with_metric = [ckpt for ckpt in self._checkpoint_history if ckpt['metric'] is not None]
+            ckpts_with_metric.sort(key=lambda x: x['metric'], reverse=(mode == 'max'))
+            best_steps = [ckpt['step'] for ckpt in ckpts_with_metric[:save_best_k]]
+            
+        keep_steps = set(latest_steps) | set(best_steps)
+        
+        # 3. Delete folders not in keep_steps
+        new_history = []
+        for ckpt in self._checkpoint_history:
+            if ckpt['step'] in keep_steps:
+                new_history.append(ckpt)
+            else:
+                if os.path.exists(ckpt['path']):
+                    print(f"Removing checkpoint: {ckpt['path']} (step {ckpt['step']} is neither among latest {max_latest_to_keep} nor best {save_best_k})")
+                    import shutil
+                    shutil.rmtree(ckpt['path'], ignore_errors=True)
+        self._checkpoint_history = new_history
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -878,8 +940,16 @@ class RayPPOTrainer:
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
+        # If we are managing best checkpoints, we disable the internal rotation in the worker
+        if self.config.trainer.get('save_best_k', 0) > 0:
+            worker_max_actor_ckpt_to_keep = None
+            worker_max_critic_ckpt_to_keep = None
+        else:
+            worker_max_actor_ckpt_to_keep = max_actor_ckpt_to_keep
+            worker_max_critic_ckpt_to_keep = max_critic_ckpt_to_keep
+
         self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=worker_max_actor_ckpt_to_keep
         )
 
         if self.use_critic:
@@ -892,8 +962,23 @@ class RayPPOTrainer:
                 )
             )
             self.critic_wg.save_checkpoint(
-                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep
+                critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=worker_max_critic_ckpt_to_keep
             )
+
+        # Update checkpoint history for manual management if save_best_k > 0
+        if self.config.trainer.get('save_best_k', 0) > 0:
+            found = False
+            for ckpt in self._checkpoint_history:
+                if ckpt['step'] == self.global_steps:
+                    found = True
+                    break
+            if not found:
+                self._checkpoint_history.append({
+                    'step': self.global_steps,
+                    'path': local_global_step_folder,
+                    'metric': None
+                })
+            self._manage_checkpoints()
 
         # save dataloader
         local_mkdir_safe(local_global_step_folder)
@@ -1540,6 +1625,7 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    self._manage_checkpoints(val_metrics)
 
                 with marked_timer("stop_profile", timing_raw):
                     next_step_profile = (

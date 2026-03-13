@@ -86,14 +86,17 @@ def get_device_flops(unit="T", device_name=None):
 
 
 def _estimate_qwen2_flops(config, tokens_sum, batch_seqlens, delta_time):
-    hidden_size = config.hidden_size
-    vocab_size = config.vocab_size
-    num_hidden_layers = config.num_hidden_layers
-    num_key_value_heads = config.num_key_value_heads
-    num_attention_heads = config.num_attention_heads
-    intermediate_size = config.intermediate_size
+    # Handle nested config structure (e.g., qwen2_5_vl with text_config in newer transformers)
+    # Fallback to top-level config for models with flat structure
+    cfg = getattr(config, "text_config", None) or config
+    hidden_size = cfg.hidden_size
+    vocab_size = cfg.vocab_size
+    num_hidden_layers = cfg.num_hidden_layers
+    num_key_value_heads = cfg.num_key_value_heads
+    num_attention_heads = cfg.num_attention_heads
+    intermediate_size = cfg.intermediate_size
 
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    head_dim = getattr(cfg, "head_dim", hidden_size // num_attention_heads)
     q_size = num_attention_heads * head_dim
     k_size = num_key_value_heads * head_dim
     v_size = num_key_value_heads * head_dim

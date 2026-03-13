@@ -526,11 +526,26 @@ class vLLMHttpServer:
             # support sglang-style 'max_new_tokens' param
             max_tokens = sampling_params.pop("max_new_tokens")
         else:
-            # Default to a calculation that considers configured lengths
-            max_tokens = self.config.response_length + self.config.prompt_length - len(prompt_ids)
+            # Default to configured response_length.
+            # Note: prompt_ids may exceed config.prompt_length for multimodal inputs
+            # (e.g., image tokens), so deriving max_tokens from prompt_length here can
+            # incorrectly hit 0 and crash vLLM.
+            max_tokens = self.config.response_length
 
         # Clamp max_tokens to the valid range [0, max_possible_tokens]
+        # (vLLM will validate >= 1; max_possible_tokens should be large enough
+        # for typical use. If it isn't, the prompt already exceeds max_model_len.)
         max_tokens = max(0, min(max_tokens, max_possible_tokens))
+
+        if max_tokens < 1:
+            raise ValueError(
+                "Computed max_tokens < 1 for vLLM generation. "
+                f"len(prompt_ids)={len(prompt_ids)}, max_model_len={self.config.max_model_len}, "
+                f"max_possible_tokens={max_possible_tokens}, prompt_length={self.config.prompt_length}, "
+                f"response_length={self.config.response_length}. "
+                "This usually indicates the prompt (often due to multimodal/image tokens) "
+                "is too long for the configured prompt/response budgeting."
+            )
 
         assert max_tokens <= max_possible_tokens, (
             f"max_tokens {max_tokens} exceeds available context space {max_possible_tokens}"

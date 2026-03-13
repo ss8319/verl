@@ -9,8 +9,9 @@
 #SBATCH --mem=768G
 #SBATCH --partition=fit
 #SBATCH --time=24:00:00
-#SBATCH --output=ssl4rl_%j.out
-#SBATCH --error=ssl4rl_%j.err
+#SBATCH --output=qwen3_%j.out
+#SBATCH --error=qwen3_%j.err
+#SBATCH --exclude=m3u009
 
 # --- Environment Setup ---
 # Automatically detect number of GPUs from SLURM
@@ -35,6 +36,17 @@ if [ -f .env ]; then
     echo "Loading environment variables from .env"
     export $(grep -v '^#' .env | xargs)
 fi
+
+# Ensure ALL cache and config directories are on scratch to avoid home quota issues
+export SCRATCH_DIR="/fs04/scratch2/ub62/ssim0070"
+export HF_HOME="${SCRATCH_DIR}/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="${SCRATCH_DIR}/.cache/huggingface/hub"
+export TRITON_CACHE_DIR="${SCRATCH_DIR}/.triton"
+export WANDB_CACHE_DIR="${SCRATCH_DIR}/.cache/wandb"
+export XDG_CACHE_HOME="${SCRATCH_DIR}/.cache"
+export XDG_CONFIG_HOME="${SCRATCH_DIR}/.config"
+export VLLM_USAGE_SOURCE=offline  # Disable vLLM usage reporting to avoid writing to home
+mkdir -p "$HF_HOME" "$TRITON_CACHE_DIR" "$WANDB_CACHE_DIR" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
 
 # Physical path on scratch for container access
 WORK_DIR="/fs04/scratch2/ub62/ssim0070/verl"
@@ -349,6 +361,9 @@ apptainer exec --nv \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BSZ_PER_GPU}" \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=32 \
+    actor_rollout_ref.model.target_modules=all-linear \
+    actor_rollout_ref.model.exclude_modules=null \
+    actor_rollout_ref.actor.freeze_vision_tower=False \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -367,9 +382,8 @@ apptainer exec --nv \
     actor_rollout_ref.rollout.name="${ROLLOUT_BACKEND}" \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.dtype=bfloat16 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_kwargs="{min_pixels:${MIN_PIXELS},max_pixels:${MAX_PIXELS}}" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
-    actor_rollout_ref.rollout.enable_prefix_caching=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
@@ -384,9 +398,9 @@ apptainer exec --nv \
     trainer.experiment_name="verl_dermogpt_${TASK}_${RUN_ID}" \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
-    trainer.save_freq=5 \
-    trainer.test_freq=5 \
-    trainer.log_val_generations=5 \
+    trainer.save_freq=50 \
+    trainer.test_freq=16 \
+    trainer.log_val_generations=2 \
     trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
     trainer.default_local_dir="${SAVE_DIR}" \
     trainer.total_epochs=20 \
