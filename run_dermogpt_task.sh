@@ -30,12 +30,25 @@ TASK=${1:-rotation}
 MODEL_PATH=${2:-"Qwen/Qwen2.5-VL-3B-Instruct"}
 DATA_LIMIT=${3:-0.25}
 RUN_ID=$SLURM_JOB_ID
+MODEL_NAME=$(basename "$MODEL_PATH")
 
 # Load environment variables from .env if it exists
 if [ -f .env ]; then
     echo "Loading environment variables from .env"
     export $(grep -v '^#' .env | xargs)
 fi
+
+# --- Environment Key Check ---
+echo "--- Environment Key Check ---"
+MISSING_KEYS=0
+if [ -z "$WANDB_API_KEY" ]; then echo "WANDB_API_KEY: NOT SET"; MISSING_KEYS=1; else echo "WANDB_API_KEY: SET"; fi
+if [ -z "$HF_TOKEN" ]; then echo "HF_TOKEN: NOT SET"; MISSING_KEYS=1; else echo "HF_TOKEN: SET"; fi
+
+if [ $MISSING_KEYS -eq 1 ]; then
+    echo "ERROR: Critical environment keys are missing. Please check your .env file."
+    exit 1
+fi
+echo "----------------------------"
 
 # Ensure ALL cache and config directories are on scratch to avoid home quota issues
 export SCRATCH_DIR="/fs04/scratch2/ub62/ssim0070"
@@ -50,8 +63,8 @@ mkdir -p "$HF_HOME" "$TRITON_CACHE_DIR" "$WANDB_CACHE_DIR" "$XDG_CACHE_HOME" "$X
 
 # Physical path on scratch for container access
 WORK_DIR="/fs04/scratch2/ub62/ssim0070/verl"
-DATASET_DIR="/fs04/scratch2/ub62/ssim0070/SSL4RL/our_datasets/dermogpt_v2/${TASK}"
-SAVE_DIR="models_v2/verl_dermogpt_${TASK}_${RUN_ID}"
+DATASET_DIR="/fs04/scratch2/ub62/ssim0070/SSL4RL/our_datasets/dermogpt_v3/${TASK}"
+SAVE_DIR="models_v3/verl_dermogpt_v3_${TASK}_${MODEL_NAME}_${RUN_ID}"
 APPTAINER_IMG="/fs04/scratch2/ub62/ssim0070/verl_vllm016.dev.sif"
 
 # Rollout backend selection
@@ -63,7 +76,7 @@ ROLLOUT_BACKEND="vllm"
 TRAIN_BATCH_SIZE=512
 VAL_BATCH_SIZE=128
 PPO_MINI_BATCH_SIZE=128
-PPO_MICRO_BSZ_PER_GPU=16
+PPO_MICRO_BSZ_PER_GPU=32
 ROLLOUT_N=5  # Number of rollouts per prompt
 # Context lengths: For 224x224 images with Qwen3-VL (patch=16, merge=2), each image = 49 tokens
 # Typical prompt: ~100 text tokens + 49 image tokens = ~150 tokens
@@ -194,6 +207,8 @@ def filter_dataset(input_path, output_path, model_path, max_len, max_pixels, min
                     if isinstance(img_entry, dict) and 'image' in img_entry:
                         img_path = img_entry['image']
                         if img_path.startswith('file://'): img_path = img_path[7:]
+                        # Resolve symlinks to handle mount points correctly
+                        img_path = os.path.realpath(img_path)
                         images.append(Image.open(img_path).convert('RGB'))
                     elif hasattr(img_entry, 'convert'):
                         images.append(img_entry.convert('RGB'))
@@ -333,7 +348,9 @@ apptainer exec --nv \
     data.trust_remote_code=true \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr=1e-5 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.1 \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=cosine \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BSZ_PER_GPU}" \
     actor_rollout_ref.model.lora_rank=64 \
@@ -374,8 +391,8 @@ apptainer exec --nv \
     algorithm.use_kl_in_reward=False \
     trainer.critic_warmup=0 \
     trainer.logger='["console", "wandb"]' \
-    trainer.project_name="verl_dermogpt_${TASK}" \
-    trainer.experiment_name="verl_dermogpt_${TASK}_${RUN_ID}" \
+    trainer.project_name="verl_dermogpt_v3_${TASK}" \
+    trainer.experiment_name="verl_dermogpt_v3_${TASK}_${MODEL_NAME}_${RUN_ID}" \
     trainer.n_gpus_per_node=$N_GPUS \
     trainer.nnodes=1 \
     trainer.save_freq=5 \

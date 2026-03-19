@@ -12,6 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+def patch_parameter_init():
+    # Monkey-patch to fix transformers/accelerate compatibility issue:
+    # "TypeError: Parameter.__new__() got an unexpected keyword argument '_is_hf_initialized'"
+    import torch
+    origin_new = torch.nn.Parameter.__new__
+    if not hasattr(origin_new, "_patched"):
+        def patched_new(cls, data=None, requires_grad=True, **kwargs):
+            kwargs.pop('_is_hf_initialized', None)
+            return origin_new(cls, data, requires_grad, **kwargs)
+        patched_new._patched = True
+        torch.nn.Parameter.__new__ = patched_new
+
+patch_parameter_init()
+
 import importlib
 import logging
 import os

@@ -123,6 +123,13 @@ ENV/
 
 # data
 *.parquet
+models_v3/
+models_v3_old/
+res_hist_*.png
+analyze_resolutions.py
+test_patch_v2.py
+test_patch_output.txt
+run_dermogpt_task_copy.sh
 
 
 # local logs

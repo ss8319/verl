@@ -51,20 +51,24 @@ def extract_format_score(text):
     return score
 
 
-def compute_score(predict_str: str, ground_truth: str, use_boxed: bool = True, format_score: float = 0.1) -> float:
+def compute_score(predict_str: str, ground_truth: str, use_boxed: bool = True, format_score: float = 0.1) -> dict:
     out_text = extract_assistant_response(predict_str)
     
     # 1. Calculate Accuracy Score (R_acc) - Weight 0.9
-    acc_score = 0.0
+    acc_reward = 0.0
     pred = extract_answer(out_text)
     ground_truths = [a.strip() for a in ground_truth.split(",")]
     if pred is not None and any(pred == gt for gt in ground_truths):
-        acc_score = 1.0
+        acc_reward = 1.0
         
     # 2. Calculate Format Score (R_format) - Weight 0.1
     format_reward = extract_format_score(out_text)
     
     # 3. Combined Score: 0.9 * R_acc + 0.1 * R_format
-    total_score = 0.9 * acc_score + 0.1 * format_reward
+    score = 0.9 * acc_reward + 0.1 * format_reward
     
-    return total_score
+    return {
+        "score": score,
+        "acc_reward": acc_reward,
+        "format_reward": format_reward,
+    }

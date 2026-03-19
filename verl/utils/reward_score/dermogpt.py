@@ -35,7 +35,7 @@ def extract_format_score(text):
         score += 0.2
     return score
 
-def compute_score(solution_str: str, ground_truth: str, format_weight: float = 0.1) -> float:
+def compute_score(solution_str: str, ground_truth: str, format_weight: float = 0.1) -> dict:
     """
     Compute reward for DermoGPT MCQA.
     Combines format correctness and answer accuracy.
@@ -54,4 +54,10 @@ def compute_score(solution_str: str, ground_truth: str, format_weight: float = 0
     if pred_answer and pred_answer.upper() == ground_truth.upper():
         acc_reward = 1.0
         
-    return (1.0 - format_weight) * acc_reward + format_weight * format_reward
+    score = (1.0 - format_weight) * acc_reward + format_weight * format_reward
+    
+    return {
+        "score": score,
+        "acc_reward": acc_reward,
+        "format_reward": format_reward,
+    }

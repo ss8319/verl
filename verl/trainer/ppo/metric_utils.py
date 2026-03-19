@@ -202,12 +202,35 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         # aborted ratio
         # Fraction of samples whose response length is zero
         "response/aborted_ratio": aborted_ratio,
-        # prompt length
+    }
+
+    # prompt length
+    metrics.update({
         "prompt_length/mean": torch.mean(prompt_length).detach().item(),
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
-    }
+    })
+
+    # extra rewards from reward_extra_info
+    for key in ["acc_reward", "format_reward"]:
+        if key in batch.non_tensor_batch:
+            val = batch.non_tensor_batch[key]
+            # Handle both numpy arrays and torch tensors
+            if isinstance(val, np.ndarray):
+                val = torch.from_numpy(val).float()
+            elif isinstance(val, torch.Tensor):
+                val = val.float()
+            else:
+                # Fallback for other types if any
+                val = torch.tensor(val).float()
+            
+            # Use only non-aborted samples for consistency with other reward metrics
+            non_aborted_val = val[non_aborted_mask.cpu()]
+            if non_aborted_val.numel() > 0:
+                metrics[f"critic/{key}/mean"] = torch.mean(non_aborted_val).item()
+                metrics[f"critic/{key}/max"] = torch.max(non_aborted_val).item()
+                metrics[f"critic/{key}/min"] = torch.min(non_aborted_val).item()
 
     # multi-turn conversation
     if "__num_turns__" in batch.non_tensor_batch:
